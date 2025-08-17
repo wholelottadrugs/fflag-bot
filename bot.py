@@ -1,40 +1,37 @@
-import re, json, io, discord
+import os
+import re
+import json
+import io
+import discord
 from discord.ext import commands
 
-# =========== SETTINGS ===========
-# Remove any flag whose NAME contains any of these substrings (case-insensitive)
-BAN_CONTAINS = {"debounce", "decomp", "humanoid"}
-
-# Optional extras if you ever need them:
-BAN_EXACT = set()   # e.g., {"DFIntS2PhysicsSenderRate"}
-BAN_REGEX = []      # e.g., [r"^DFInt.*Bandwidth.*$"]
+# ================= SETTINGS =================
+BAN_CONTAINS = {"debounce", "decomp", "humanoid"}  # banned substrings
+BAN_EXACT = set()   # e.g. {"DFIntS2PhysicsSenderRate"}
+BAN_REGEX = []      # e.g. [r"^DFInt.*Bandwidth.*$"]
 
 COMMAND_PREFIX = "!"
 CLEAN_FILENAME = "cleared_list.json"
 REMOVED_FILENAME = "removed_flags.txt"
-# ================================
-
-TOKEN = "MTQwNjcwOTM3NzE5MjQzMTYzOA.Ght7kQ.SYpSwVcba8PuVEyuCB-Q8_uNvlujNDFqZEE7dQ"  # <- put your token between quotes
+# ============================================
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 
+
 def is_banned(name: str) -> bool:
     nlow = name.lower()
     if name in BAN_EXACT:
         return True
-    if any(s in nlow for s in (s.lower() for s in BAN_CONTAINS)):
+    if any(s in nlow for s in BAN_CONTAINS):
         return True
     if any(re.search(rx, name) for rx in BAN_REGEX):
         return True
     return False
 
+
 def parse_fflags(raw: str) -> dict:
-    """
-    Accepts valid JSON or loose JSON-ish lists of "Key": value lines.
-    Returns {key: value_as_string}.
-    """
     # Try strict JSON first
     try:
         data = json.loads(raw)
@@ -52,6 +49,7 @@ def parse_fflags(raw: str) -> dict:
         out[k] = v
     return out
 
+
 def filter_flags(ff: dict):
     kept, removed = {}, []
     for k, v in ff.items():
@@ -61,17 +59,18 @@ def filter_flags(ff: dict):
             kept[k] = v
     return kept, removed
 
+
 def to_json(d: dict) -> str:
-    # Keep values as strings for consistent output
     return json.dumps({k: str(v) for k, v in d.items()}, indent=4, ensure_ascii=False)
+
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (id: {bot.user.id})")
+    print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
 
-@bot.command(name="scan", help="Attach an FFlag file and run !scan (or reply to a file with !scan)")
+
+@bot.command(name="scan", help="Attach an FFlag file and run !scan")
 async def scan(ctx: commands.Context):
-    # Find an attachment either on this message or the replied-to message
     att = None
     if ctx.message.attachments:
         att = ctx.message.attachments[0]
@@ -100,7 +99,7 @@ async def scan(ctx: commands.Context):
     ]
 
     title = "Illegal Flags Found!" if removed else "No Illegal Flags Found"
-    desc = f"Scan complete for **{att.filename}**.\nRemoved **{len(removed)}** flag(s). Cleaned list attached as `{CLEAN_FILENAME}`."
+    desc = f"Scan complete for **{att.filename}**.\nRemoved **{len(removed)}** flag(s)."
 
     if removed_lines:
         preview = "\n".join(removed_lines)[:1500]
@@ -114,5 +113,9 @@ async def scan(ctx: commands.Context):
 
     await ctx.reply(embed=embed, files=files, mention_author=False)
 
+
 if __name__ == "__main__":
+    TOKEN = os.getenv("DISCORD_TOKEN")
+    if not TOKEN:
+        raise SystemExit("❌ No DISCORD_TOKEN environment variable set.")
     bot.run(TOKEN)
