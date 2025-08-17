@@ -1,4 +1,4 @@
-import os, re, json, io, csv, datetime
+import os, re, json, io, csv, datetime, asyncio
 import discord
 from discord.ext import commands
 import aiosqlite
@@ -10,15 +10,15 @@ BAN_REGEX = []                                     # e.g. [r"^DFInt.*Bandwidth.*
 
 COMMAND_PREFIX = "!"
 CLEAN_FILENAME = "cleared_list.json"
-MAX_READ_BYTES = 1_000_000       # Ignore attachments larger than this
-MAX_DB_TEXT = 500_000            # Trim very large JSON blobs before storing (safety)
+MAX_READ_BYTES = 1_000_000        # Ignore attachments larger than this
+MAX_DB_TEXT   = 500_000           # Trim very large JSON blobs before storing
 
-DB_PATH = "bot.db"               # On Railway this is ephemeral; use dump/export to save data
+DB_PATH = "bot.db"                # Ephemeral on Railway; use export/dump to save
 # ============================================
 
 intents = discord.Intents.default()
-intents.message_content = True
 intents.guilds = True
+intents.message_content = True
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 
 # ---------- DB ----------
@@ -46,7 +46,6 @@ async def init_db():
         removed_ct    INTEGER,
         kept_ct       INTEGER,
         created_at    TEXT,
-        raw_flags     TEXT,   -- original text provided
         kept_json     TEXT,   -- cleaned JSON we sent back
         removed_json  TEXT    -- JSON object of removed flags
     );
@@ -79,26 +78,23 @@ async def is_guild_banned(guild_id: int) -> bool:
 
 async def log_scan(guild_id: int, user_id: int, filename: str,
                    removed_ct: int, kept_ct: int,
-                   raw_flags: str, kept_json: str, removed_json: str) -> int:
+                   kept_json: str, removed_json: str) -> int:
     """Insert a scan row and return its id."""
     if db is None: return 0
-    # Trim huge blobs defensively
-    raw_flags   = raw_flags[:MAX_DB_TEXT]
-    kept_json   = kept_json[:MAX_DB_TEXT]
-    removed_json= removed_json[:MAX_DB_TEXT]
-
+    kept_json    = kept_json[:MAX_DB_TEXT]
+    removed_json = removed_json[:MAX_DB_TEXT]
     await db.execute(
-        "INSERT INTO scans(guild_id,user_id,filename,removed_ct,kept_ct,created_at,raw_flags,kept_json,removed_json) "
-        "VALUES(?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO scans(guild_id,user_id,filename,removed_ct,kept_ct,created_at,kept_json,removed_json) "
+        "VALUES(?,?,?,?,?,?,?,?)",
         (guild_id, user_id, filename, removed_ct, kept_ct,
-         datetime.datetime.utcnow().isoformat(), raw_flags, kept_json, removed_json)
+         datetime.datetime.utcnow().isoformat(), kept_json, removed_json)
     )
     await db.commit()
     cur = await db.execute("SELECT last_insert_rowid()")
     return (await cur.fetchone())[0]
 
 # ---------- FFlag helpers ----------
-def is_banned(name: str) -> bool:
+def is_banned_flagname(name: str) -> bool:
     nlow = name.lower()
     if name in BAN_EXACT:
         return True
@@ -121,14 +117,12 @@ def strip_code_fences(text: str) -> str:
 
 def parse_fflags(raw: str) -> dict:
     raw = strip_code_fences(raw).lstrip("\ufeff")  # strip BOM if present
-
     # Try strict JSON first
     try:
         data = json.loads(raw)
         return {str(k): (v if isinstance(v, str) else str(v)) for k, v in data.items()}
     except Exception:
         pass
-
     # Fallback tolerant parser for lines like  "Key": value
     pairs = re.findall(r'"([^"]+)"\s*:\s*([^,\n}]+)', raw)
     out = {}
@@ -142,7 +136,7 @@ def parse_fflags(raw: str) -> dict:
 def filter_flags(ff: dict):
     kept, removed = {}, {}
     for k, v in ff.items():
-        if is_banned(k):
+        if is_banned_flagname(k):
             removed[k] = v
         else:
             kept[k] = v
@@ -155,13 +149,24 @@ def to_json(d: dict) -> str:
 @bot.event
 async def on_ready():
     await init_db()
+    # record / refresh all current guilds
     for g in bot.guilds:
         await upsert_guild(g)
+    # audit: immediately leave any banned guilds we are currently in
+    for g in list(bot.guilds):
+        if await is_guild_banned(g.id):
+            try:
+                if g.system_channel:
+                    await g.system_channel.send("🚫 This bot is banned on this server. Leaving…")
+            except Exception:
+                pass
+            await g.leave()
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="FFlags"))
     print(f"✅ Logged in as {bot.user} | Guilds: {len(bot.guilds)}")
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
+    # When invited, store and immediately leave if banned
     await upsert_guild(guild)
     if await is_guild_banned(guild.id):
         try:
@@ -171,7 +176,7 @@ async def on_guild_join(guild: discord.Guild):
             pass
         await guild.leave()
 
-# Gate banned guilds from running commands
+# Global gate: block commands in banned guilds
 @bot.check
 async def guild_gate(ctx: commands.Context):
     if ctx.guild is None:
@@ -192,7 +197,7 @@ async def on_command_error(ctx, error):
 # ---------- Commands ----------
 @bot.command(name="scan", help="Attach a .txt/.json (or reply/paste JSON) then run !scan.")
 async def scan(ctx: commands.Context):
-    # 1) Get data: attachment > replied message attachment > inline JSON
+    # attachment > replied attachment > inline JSON
     att = None
     if ctx.message.attachments:
         att = ctx.message.attachments[0]
@@ -219,7 +224,6 @@ async def scan(ctx: commands.Context):
     if not raw:
         return await ctx.reply("Attach a file or paste JSON after `!scan`.", mention_author=False)
 
-    # 2) Parse & filter
     fflags = parse_fflags(raw)
     if not fflags:
         return await ctx.reply("❌ Couldn’t parse any flags.", mention_author=False)
@@ -231,25 +235,21 @@ async def scan(ctx: commands.Context):
     cleaned_json_bytes = kept_json_str.encode("utf-8")
     files = [discord.File(io.BytesIO(cleaned_json_bytes), filename=CLEAN_FILENAME)]
 
-    # 3) Log to DB (store raw flags + kept + removed)
     scan_id = await log_scan(
         ctx.guild.id if ctx.guild else 0,
         ctx.author.id,
         src_name or "",
         removed_ct=len(removed),
         kept_ct=len(kept),
-        raw_flags=raw,
         kept_json=kept_json_str,
         removed_json=removed_json_str
     )
 
-    # 4) Respond
     title = "Illegal Flags Found!" if removed else "No Illegal Flags Found"
     desc = (
         f"Scan **#{scan_id}** for **{src_name}**\n"
         f"Removed **{len(removed)}** • Kept **{len(kept)}**."
     )
-
     if removed:
         preview_lines = [f'"{k}": "{v}"' for k, v in removed.items()]
         preview = "\n".join(preview_lines)
@@ -258,8 +258,7 @@ async def scan(ctx: commands.Context):
         desc += "\n\n**Removed (preview):**\n```json\n" + preview + "\n```"
 
     embed = discord.Embed(
-        title=title,
-        description=desc,
+        title=title, description=desc,
         color=discord.Color.red() if removed else discord.Color.green()
     )
     await ctx.reply(embed=embed, files=files, mention_author=False)
@@ -298,17 +297,41 @@ async def servers(ctx: commands.Context):
 @commands.is_owner()
 async def banserver(ctx: commands.Context, guild_id: int):
     await set_guild_ban(guild_id, 1)
-    if ctx.guild and ctx.guild.id == guild_id:
-        await ctx.reply("🚫 Banned this server. Leaving…", mention_author=False)
-        await ctx.guild.leave()
+    # If we're in that guild now, leave it immediately
+    target = discord.utils.get(bot.guilds, id=guild_id)
+    if target:
+        try:
+            if target.system_channel:
+                await target.system_channel.send("🚫 Bot banned by owner. Leaving…")
+        except Exception:
+            pass
+        await target.leave()
+        await ctx.reply(f"🚫 Banned and left `{guild_id}`.", mention_author=False)
     else:
-        await ctx.reply(f"🚫 Banned server `{guild_id}`.", mention_author=False)
+        await ctx.reply(f"🚫 Banned `{guild_id}`. If invited again, bot will auto-leave.", mention_author=False)
+
+@bot.command(name="banhere", help="Ban the current server & leave (owner-only).")
+@commands.is_owner()
+async def banhere(ctx: commands.Context):
+    if ctx.guild is None:
+        return await ctx.reply("Run this in a server.", mention_author=False)
+    await set_guild_ban(ctx.guild.id, 1)
+    await ctx.reply("🚫 This server is now banned. Leaving…", mention_author=False)
+    await ctx.guild.leave()
 
 @bot.command(name="unbanserver", help="Unban a server by ID (owner-only).")
 @commands.is_owner()
 async def unbanserver(ctx: commands.Context, guild_id: int):
     await set_guild_ban(guild_id, 0)
-    await ctx.reply(f"✅ Unbanned server `{guild_id}`.", mention_author=False)
+    await ctx.reply(f"✅ Unbanned `{guild_id}`.", mention_author=False)
+
+@bot.command(name="unbanhere", help="Unban the current server (owner-only).")
+@commands.is_owner()
+async def unbanhere(ctx: commands.Context):
+    if ctx.guild is None:
+        return await ctx.reply("Run this in a server.", mention_author=False)
+    await set_guild_ban(ctx.guild.id, 0)
+    await ctx.reply("✅ This server has been unbanned.", mention_author=False)
 
 @bot.command(name="exportscans", help="Export scan metadata as CSV (owner-only).")
 @commands.is_owner()
@@ -330,24 +353,19 @@ async def exportscans(ctx: commands.Context):
     data = io.BytesIO(buf.getvalue().encode("utf-8"))
     await ctx.reply(file=discord.File(data, filename="scans_export.csv"), mention_author=False)
 
-@bot.command(name="scanjson", help="Download full JSON for a scan id (owner-only). Usage: !scanjson 12")
+@bot.command(name="scanjson", help="Download kept/removed JSON for a scan id (owner-only). Usage: !scanjson 12")
 @commands.is_owner()
 async def scanjson(ctx: commands.Context, scan_id: int):
     if not db:
         return await ctx.reply("DB not ready.", mention_author=False)
     cur = await db.execute(
-        "SELECT kept_json, removed_json, raw_flags FROM scans WHERE id=?", (scan_id,)
+        "SELECT kept_json, removed_json FROM scans WHERE id=?", (scan_id,)
     )
     row = await cur.fetchone()
     if not row:
         return await ctx.reply("Scan id not found.", mention_author=False)
 
-    payload = {
-        "id": scan_id,
-        "kept": json.loads(row[0]) if row[0] else {},
-        "removed": json.loads(row[1]) if row[1] else {},
-        "raw_flags": row[2] or ""
-    }
+    payload = {"id": scan_id, "kept": json.loads(row[0]) if row[0] else {}, "removed": json.loads(row[1]) if row[1] else {}}
     data = io.BytesIO(json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"))
     await ctx.reply(file=discord.File(data, filename=f"scan_{scan_id}.json"), mention_author=False)
 
