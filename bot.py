@@ -12,7 +12,7 @@ BAN_REGEX = []      # e.g. [r"^DFInt.*Bandwidth.*$"]
 
 COMMAND_PREFIX = "!"
 CLEAN_FILENAME = "cleared_list.json"
-REMOVED_FILENAME = "removed_flags.txt"
+MAX_READ_BYTES = 1_000_000  # 1 MB safety
 # ============================================
 
 intents = discord.Intents.default()
@@ -31,7 +31,21 @@ def is_banned(name: str) -> bool:
     return False
 
 
+def strip_code_fences(text: str) -> str:
+    """Remove ```json ...``` fences if present."""
+    text = text.strip()
+    if text.startswith("```") and text.endswith("```"):
+        core = text[3:-3].strip()
+        first_nl = core.find("\n")
+        if first_nl != -1 and core[:first_nl].lower() in {"json", "txt"}:
+            core = core[first_nl+1:]
+        return core
+    return text
+
+
 def parse_fflags(raw: str) -> dict:
+    raw = strip_code_fences(raw).lstrip("\ufeff")  # strip BOM if present
+
     # Try strict JSON first
     try:
         data = json.loads(raw)
@@ -66,10 +80,11 @@ def to_json(d: dict) -> str:
 
 @bot.event
 async def on_ready():
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="FFlags"))
     print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
 
 
-@bot.command(name="scan", help="Attach an FFlag file and run !scan")
+@bot.command(name="scan", help="Attach a .txt/.json (or reply to one) and run !scan. You can also paste JSON.")
 async def scan(ctx: commands.Context):
     att = None
     if ctx.message.attachments:
@@ -82,36 +97,58 @@ async def scan(ctx: commands.Context):
         except Exception:
             pass
 
-    if not att:
-        return await ctx.reply("Attach a `.txt` or `.json` with your FFlags (or reply to one) and run `!scan`.")
+    raw = None
+    src_name = None
 
-    raw = (await att.read()).decode("utf-8", errors="ignore")
+    if att:
+        if att.size and att.size > MAX_READ_BYTES:
+            return await ctx.reply("❌ File too large.", mention_author=False)
+        data = await att.read()
+        raw = data.decode("utf-8", errors="ignore")
+        src_name = att.filename
+    else:
+        # Try inline JSON/code block text
+        parts = ctx.message.content.split(" ", 1)
+        if len(parts) > 1:
+            raw = parts[1].strip()
+            src_name = "message_content"
+
+    if not raw:
+        return await ctx.reply("Attach a file or paste JSON after `!scan`.", mention_author=False)
+
     fflags = parse_fflags(raw)
+    if not fflags:
+        return await ctx.reply("❌ Couldn’t parse any flags.", mention_author=False)
+
     kept, removed = filter_flags(fflags)
-
     cleaned_json = to_json(kept).encode("utf-8")
+    files = [discord.File(io.BytesIO(cleaned_json), filename=CLEAN_FILENAME)]
+
     removed_lines = [f'"{k}": "{v}"' for k, v in removed]
-    removed_txt = ("\n".join(removed_lines) if removed_lines else "—").encode("utf-8")
-
-    files = [
-        discord.File(io.BytesIO(cleaned_json), filename=CLEAN_FILENAME),
-        discord.File(io.BytesIO(removed_txt), filename=REMOVED_FILENAME),
-    ]
-
     title = "Illegal Flags Found!" if removed else "No Illegal Flags Found"
-    desc = f"Scan complete for **{att.filename}**.\nRemoved **{len(removed)}** flag(s)."
+    desc = f"Scan complete for **{src_name}**.\nRemoved **{len(removed)}** flag(s). Kept **{len(kept)}**."
 
     if removed_lines:
-        preview = "\n".join(removed_lines)[:1500]
-        desc += "\n\n**Removed Lines (preview):**\n```json\n" + preview + "\n```"
+        preview = "\n".join(removed_lines)
+        if len(preview) > 1500:
+            preview = preview[:1500] + "\n… (truncated)"
+        desc += "\n\n**Removed (preview):**\n```json\n" + preview + "\n```"
 
     embed = discord.Embed(
         title=title,
         description=desc,
         color=discord.Color.red() if removed else discord.Color.green()
     )
-
     await ctx.reply(embed=embed, files=files, mention_author=False)
+
+
+@bot.command(name="status", help="Show bot health info")
+async def status(ctx: commands.Context):
+    await ctx.reply(
+        f"✅ Online as **{bot.user}** | Prefix `{bot.command_prefix}`\n"
+        f"• Banned substrings: {', '.join(sorted(BAN_CONTAINS)) or 'None'}",
+        mention_author=False
+    )
 
 
 if __name__ == "__main__":
